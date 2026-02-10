@@ -14,6 +14,8 @@ import { Client, GatewayIntentBits, WebhookClient } from 'discord.js';
 import express from 'express';
 import { CHARACTERS, getCharacter, listCharacters, getAllFeuds } from './characters.js';
 import { StorylineEngine } from './storyline-engine.js';
+import { ChampionshipTracker, CHAMPIONSHIPS } from './championships.js';
+import { ANNOUNCERS, getAnnouncerReactions, buildAnnouncerPrompt } from './announcers.js';
 
 // ---------------------------------------------------------------------------
 // Config
@@ -36,6 +38,7 @@ const CONFIG = {
 // State
 // ---------------------------------------------------------------------------
 const storyline = new StorylineEngine();
+const championships = new ChampionshipTracker();
 let webhookClient = null;
 let discordClient = null;
 const messageHistory = [];
@@ -99,6 +102,12 @@ async function startDiscord() {
       await sleep(typingDelay);
       
       await sendAsCharacter(responder.characterId, response, message.channel);
+      
+      // Trigger announcer commentary for dramatic moments
+      if (responder.isSurprise) {
+        const char = getCharacter(responder.characterId);
+        triggerAnnouncerCommentary(responder.reason, `${char?.name || responder.characterId} just appeared!`, message.channel);
+      }
     }
   });
   
@@ -133,6 +142,12 @@ async function generateResponse(responder, triggerMessage, history) {
   let userPrompt = `Here's the recent conversation in the Discord server:\n\n${recentMessages}\n\n`;
   if (responder.context) userPrompt += `STORYLINE DIRECTION: ${responder.context}\n\n`;
   if (responder.isSurprise) userPrompt += `THIS IS YOUR DRAMATIC ENTRANCE. Make it memorable.\n\n`;
+  
+  // Add championship context
+  const charTitles = championships.getTitlesForCharacter(responder.characterId);
+  if (charTitles.length > 0) {
+    userPrompt += `YOU ARE THE CURRENT ${charTitles.map(t => t.displayName).join(' AND ')} CHAMPION. Reference your gold.\n\n`;
+  }
   userPrompt += `Respond in character as ${char.name}. Keep it to 1-3 sentences max (this is Discord chat, not a speech). Be entertaining and stay in character.`;
   
   try {
@@ -335,6 +350,52 @@ function startAPI() {
     res.json({ ok: true, state: storyline.getState() });
   });
   
+  // ---------- Championship Routes ----------
+  
+  app.get('/championships', (req, res) => {
+    res.json({ ok: true, championships: championships.getState() });
+  });
+  
+  app.post('/championships/award', async (req, res) => {
+    const { titleId, characterId, method } = req.body;
+    if (!titleId || !characterId) return res.status(400).json({ error: 'titleId and characterId required' });
+    
+    const result = championships.awardTitle(titleId, characterId, method || 'pinfall');
+    if (!result) return res.status(400).json({ error: 'Invalid title' });
+    
+    // Save championship state with storyline
+    storyline.championshipData = championships.toJSON();
+    await storyline.saveState();
+    
+    // Trigger announcer commentary for title changes
+    if (CONFIG.channelId && discordClient) {
+      const channel = discordClient.channels?.cache?.get(CONFIG.channelId);
+      const char = getCharacter(characterId);
+      const announcement = `🏆 **NEW ${result.titleName.toUpperCase()} CHAMPION: ${char?.displayName || characterId}!**`;
+      
+      if (webhookClient) {
+        await webhookClient.send({ content: announcement, username: '📢 Ring Announcer' });
+      } else if (channel) {
+        await channel.send(announcement);
+      }
+      
+      if (channel) {
+        triggerAnnouncerCommentary('title-change', `${char?.name} just won the ${result.titleName}! Previous champion: ${result.previousChampion || 'vacant'}`, channel);
+      }
+    }
+    
+    res.json({ ok: true, result });
+  });
+  
+  app.post('/championships/vacate', async (req, res) => {
+    const { titleId } = req.body;
+    if (!titleId) return res.status(400).json({ error: 'titleId required' });
+    championships.vacateTitle(titleId);
+    storyline.championshipData = championships.toJSON();
+    await storyline.saveState();
+    res.json({ ok: true });
+  });
+  
   app.get('/history', (req, res) => {
     const limit = parseInt(req.query.limit || '50');
     res.json({ ok: true, messages: messageHistory.slice(-limit) });
@@ -449,6 +510,17 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <div id="roster" class="character-grid"></div>
   </div>
 
+  <!-- Championships -->
+  <div class="card">
+    <h2>🏆 Championships</h2>
+    <div id="champList" style="display:grid; gap:8px;"></div>
+    <div class="input-row" style="margin-top:12px;">
+      <select id="champTitle"></select>
+      <select id="champChar"></select>
+      <button class="btn btn-yellow" onclick="awardTitle()">👑 Award Title</button>
+    </div>
+  </div>
+
   <!-- Feuds -->
   <div class="card">
     <h2>🔥 Active Feuds</h2>
@@ -495,10 +567,13 @@ async function fetchJSON(url, opts) {
   return r.json();
 }
 
+let champData = null;
+
 async function refreshState() {
-  [state, characters] = await Promise.all([
+  [state, characters, champData] = await Promise.all([
     fetchJSON('/state'),
     fetchJSON('/characters'),
+    fetchJSON('/championships'),
   ]);
   render();
 }
@@ -550,10 +625,27 @@ function render() {
   
   // Dropdowns
   const options = charEntries.map(([id, c]) => \`<option value="\${id}">\${c.name}</option>\`).join('');
-  ['feudChar1','feudChar2','speakChar'].forEach(sel => {
+  ['feudChar1','feudChar2','speakChar','champChar'].forEach(sel => {
     document.getElementById(sel).innerHTML = options;
   });
   
+  // Championships
+  const champList = document.getElementById('champList');
+  if (champData?.championships) {
+    champList.innerHTML = Object.entries(champData.championships).map(([id, c]) => {
+      const holderName = c.holder ? (characters.characters[c.holder]?.name || c.holder) : 'VACANT';
+      const color = c.holder ? '#4ade80' : '#666';
+      return \`<div style="background:#16213e; border-radius:6px; padding:10px; display:flex; justify-content:space-between; align-items:center;">
+        <div><strong>\${c.displayName}</strong></div>
+        <div style="color:\${color}; font-weight:bold;">\${holderName}\${c.defenses > 0 ? ' ('+c.defenses+' defenses)' : ''}</div>
+      </div>\`;
+    }).join('');
+    
+    // Championship dropdowns
+    const titleOpts = Object.entries(champData.championships).map(([id, c]) => \`<option value="\${id}">\${c.name}</option>\`).join('');
+    document.getElementById('champTitle').innerHTML = titleOpts;
+  }
+
   // Story beats
   const beats = document.getElementById('storyBeats');
   beats.innerHTML = s.recentHistory.slice(-10).reverse().map(h => 
@@ -604,6 +696,14 @@ async function createFeud() {
   refreshState();
 }
 
+async function awardTitle() {
+  const titleId = document.getElementById('champTitle').value;
+  const characterId = document.getElementById('champChar').value;
+  const r = await fetchJSON('/championships/award', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ titleId, characterId }) });
+  if (r.ok) alert('👑 ' + (r.result.titleName) + ' awarded to ' + characterId);
+  refreshState();
+}
+
 async function toggleCharacter(id, isActive) {
   await fetchJSON('/characters', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id, active: !isActive }) });
   refreshState();
@@ -617,6 +717,46 @@ setInterval(loadChat, 8000);
 </script>
 </body>
 </html>`;
+
+// ---------------------------------------------------------------------------
+// Announcer Commentary
+// ---------------------------------------------------------------------------
+async function triggerAnnouncerCommentary(eventType, contextText, channel) {
+  const reactingAnnouncers = getAnnouncerReactions(eventType);
+  for (const announcerId of reactingAnnouncers) {
+    const prompt = buildAnnouncerPrompt(announcerId, eventType, contextText);
+    if (!prompt) continue;
+
+    await sleep(1500 + Math.random() * 2000);
+
+    try {
+      const response = await fetch(`${CONFIG.ollamaUrl}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: CONFIG.model,
+          messages: [
+            { role: 'system', content: prompt.system },
+            { role: 'user', content: prompt.prompt },
+          ],
+          stream: false,
+          options: { temperature: 0.9, top_p: 0.95, num_predict: 100 },
+        }),
+      });
+      const data = await response.json();
+      const text = (data.message?.content || '').trim().slice(0, 300);
+      if (!text) continue;
+
+      if (webhookClient) {
+        await webhookClient.send({ content: text, username: prompt.displayName, avatarURL: prompt.avatar });
+      } else if (channel) {
+        await channel.send(`**${prompt.displayName}:** ${text}`);
+      }
+    } catch (err) {
+      console.error(`Announcer ${announcerId} error:`, err.message);
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Utilities
@@ -635,6 +775,12 @@ async function main() {
   
   // Load persisted storyline state
   await storyline.loadState();
+  
+  // Load championship state if saved
+  if (storyline.championshipData) {
+    championships.loadFrom(storyline.championshipData);
+    console.log('Loaded championship state');
+  }
   
   startAPI();
   await startDiscord();
