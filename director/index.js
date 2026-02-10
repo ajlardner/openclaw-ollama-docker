@@ -8,13 +8,11 @@
  * - Storyline engine decides which characters respond
  * - Ollama generates responses in-character
  * - Discord webhooks post responses with character names/avatars
- * 
- * This means you only need ONE Discord bot, not one per character.
  */
 
 import { Client, GatewayIntentBits, WebhookClient } from 'discord.js';
 import express from 'express';
-import { CHARACTERS, getCharacter, listCharacters } from './characters.js';
+import { CHARACTERS, getCharacter, listCharacters, getAllFeuds } from './characters.js';
 import { StorylineEngine } from './storyline-engine.js';
 
 // ---------------------------------------------------------------------------
@@ -25,16 +23,12 @@ const CONFIG = {
   ollamaUrl: process.env.OLLAMA_URL || 'http://ollama:11434',
   model: process.env.OLLAMA_MODEL || 'qwen3-coder',
   guildId: process.env.DISCORD_GUILD_ID,
-  channelId: process.env.DISCORD_CHANNEL_ID,  // main channel to operate in
-  webhookUrl: process.env.DISCORD_WEBHOOK_URL, // webhook for posting as characters
+  channelId: process.env.DISCORD_CHANNEL_ID,
+  webhookUrl: process.env.DISCORD_WEBHOOK_URL,
   apiPort: parseInt(process.env.DIRECTOR_PORT || '9091'),
-  
-  // Timing
-  responseDelayMs: parseInt(process.env.RESPONSE_DELAY_MS || '3000'),  // feel more natural
-  typingDelayPerChar: parseInt(process.env.TYPING_DELAY_PER_CHAR || '30'), // ms per character
+  responseDelayMs: parseInt(process.env.RESPONSE_DELAY_MS || '3000'),
+  typingDelayPerChar: parseInt(process.env.TYPING_DELAY_PER_CHAR || '30'),
   maxResponseLength: parseInt(process.env.MAX_RESPONSE_LENGTH || '500'),
-  
-  // Promos
   promoIntervalMinutes: parseInt(process.env.PROMO_INTERVAL_MIN || '30'),
 };
 
@@ -44,16 +38,17 @@ const CONFIG = {
 const storyline = new StorylineEngine();
 let webhookClient = null;
 let discordClient = null;
-const messageHistory = []; // Last N messages for context
-const MAX_HISTORY = 20;
+const messageHistory = [];
+const MAX_HISTORY = 50;
+let isPaused = false;
 
 // ---------------------------------------------------------------------------
 // Discord Bot Setup
 // ---------------------------------------------------------------------------
 async function startDiscord() {
   if (!CONFIG.discordToken) {
-    console.error('DISCORD_BOT_TOKEN is required');
-    process.exit(1);
+    console.warn('DISCORD_BOT_TOKEN not set — running in API-only mode');
+    return;
   }
   
   discordClient = new Client({
@@ -64,7 +59,6 @@ async function startDiscord() {
     ],
   });
   
-  // Set up webhook client
   if (CONFIG.webhookUrl) {
     webhookClient = new WebhookClient({ url: CONFIG.webhookUrl });
   }
@@ -75,47 +69,35 @@ async function startDiscord() {
   });
   
   discordClient.on('messageCreate', async (message) => {
-    // Ignore our own webhook messages and bot messages
     if (message.webhookId) return;
     if (message.author.bot && message.author.id === discordClient.user.id) return;
-    
-    // Only respond in configured channel
     if (CONFIG.channelId && message.channel.id !== CONFIG.channelId) return;
+    if (isPaused) return;
     
-    // Track message
     messageHistory.push({
       author: message.author.username,
       content: message.content,
       timestamp: Date.now(),
     });
-    if (messageHistory.length > MAX_HISTORY) messageHistory.shift();
+    while (messageHistory.length > MAX_HISTORY) messageHistory.shift();
     
-    // Determine if any character posted this (check if it's a known character webhook)
     const authorCharacterId = identifyCharacter(message.author.username);
-    
-    // Ask storyline engine who should respond
     const responders = storyline.decideResponders(message.content, authorCharacterId);
     
     if (responders.length === 0) return;
     
-    // Generate and send responses with natural delays
     for (const responder of responders) {
-      // Natural delay before responding
       const delay = CONFIG.responseDelayMs + Math.random() * 2000;
       await sleep(delay);
       
-      // Show typing indicator
       try { await message.channel.sendTyping(); } catch (e) {}
       
-      // Generate response
       const response = await generateResponse(responder, message.content, messageHistory);
       if (!response) continue;
       
-      // Typing delay proportional to message length
       const typingDelay = Math.min(response.length * CONFIG.typingDelayPerChar, 5000);
       await sleep(typingDelay);
       
-      // Send via webhook
       await sendAsCharacter(responder.characterId, response, message.channel);
     }
   });
@@ -142,7 +124,6 @@ async function generateResponse(responder, triggerMessage, history) {
   const char = getCharacter(responder.characterId);
   if (!char) return null;
   
-  // Build conversation context
   const recentMessages = history.slice(-10).map(m => 
     `${m.author}: ${m.content}`
   ).join('\n');
@@ -150,15 +131,8 @@ async function generateResponse(responder, triggerMessage, history) {
   const systemPrompt = char.personality;
   
   let userPrompt = `Here's the recent conversation in the Discord server:\n\n${recentMessages}\n\n`;
-  
-  if (responder.context) {
-    userPrompt += `STORYLINE DIRECTION: ${responder.context}\n\n`;
-  }
-  
-  if (responder.isSurprise) {
-    userPrompt += `THIS IS YOUR DRAMATIC ENTRANCE. Make it memorable.\n\n`;
-  }
-  
+  if (responder.context) userPrompt += `STORYLINE DIRECTION: ${responder.context}\n\n`;
+  if (responder.isSurprise) userPrompt += `THIS IS YOUR DRAMATIC ENTRANCE. Make it memorable.\n\n`;
   userPrompt += `Respond in character as ${char.name}. Keep it to 1-3 sentences max (this is Discord chat, not a speech). Be entertaining and stay in character.`;
   
   try {
@@ -172,28 +146,17 @@ async function generateResponse(responder, triggerMessage, history) {
           { role: 'user', content: userPrompt },
         ],
         stream: false,
-        options: {
-          temperature: 0.9,      // Creative responses
-          top_p: 0.95,
-          num_predict: 200,      // Keep responses short
-        },
+        options: { temperature: 0.9, top_p: 0.95, num_predict: 200 },
       }),
     });
     
     const data = await response.json();
     let text = data.message?.content || '';
     
-    // Truncate if too long
     if (text.length > CONFIG.maxResponseLength) {
       text = text.slice(0, CONFIG.maxResponseLength).trim();
-      // Try to end at a sentence
-      const lastPeriod = text.lastIndexOf('.');
-      const lastExclaim = text.lastIndexOf('!');
-      const lastQuestion = text.lastIndexOf('?');
-      const lastEnd = Math.max(lastPeriod, lastExclaim, lastQuestion);
-      if (lastEnd > text.length * 0.5) {
-        text = text.slice(0, lastEnd + 1);
-      }
+      const lastEnd = Math.max(text.lastIndexOf('.'), text.lastIndexOf('!'), text.lastIndexOf('?'));
+      if (lastEnd > text.length * 0.5) text = text.slice(0, lastEnd + 1);
     }
     
     return text.trim();
@@ -204,7 +167,7 @@ async function generateResponse(responder, triggerMessage, history) {
 }
 
 // ---------------------------------------------------------------------------
-// Send Message as Character (via Webhook)
+// Send Message as Character
 // ---------------------------------------------------------------------------
 async function sendAsCharacter(characterId, content, channel) {
   const char = getCharacter(characterId);
@@ -212,27 +175,24 @@ async function sendAsCharacter(characterId, content, channel) {
   
   try {
     if (webhookClient) {
-      // Use webhook — posts with character's name and avatar
       await webhookClient.send({
         content,
         username: char.displayName,
         avatarURL: char.avatar,
       });
-    } else {
-      // Fallback: post as bot with character prefix
+    } else if (channel) {
       await channel.send(`**${char.displayName}:** ${content}`);
     }
     
-    // Track in history
     messageHistory.push({
       author: char.name,
       content,
       timestamp: Date.now(),
       isCharacter: true,
     });
-    if (messageHistory.length > MAX_HISTORY) messageHistory.shift();
+    while (messageHistory.length > MAX_HISTORY) messageHistory.shift();
     
-    console.log(`[${char.name}] ${content.slice(0, 80)}...`);
+    console.log(`[${char.name}] ${content.slice(0, 100)}...`);
   } catch (err) {
     console.error(`Failed to send as ${char.name}:`, err.message);
   }
@@ -245,7 +205,8 @@ function startPromoSchedule() {
   if (CONFIG.promoIntervalMinutes <= 0) return;
   
   setInterval(async () => {
-    // Pick a random active character
+    if (isPaused) return;
+    
     const activeChars = storyline.getState().activeCharacters;
     if (activeChars.length === 0) return;
     
@@ -259,11 +220,9 @@ function startPromoSchedule() {
       messageHistory
     );
     
-    if (response && CONFIG.channelId) {
-      const channel = discordClient?.channels?.cache?.get(CONFIG.channelId);
-      if (channel) {
-        await sendAsCharacter(charId, response, channel);
-      }
+    if (response && CONFIG.channelId && discordClient) {
+      const channel = discordClient.channels?.cache?.get(CONFIG.channelId);
+      if (channel) await sendAsCharacter(charId, response, channel);
     }
   }, CONFIG.promoIntervalMinutes * 60 * 1000);
   
@@ -271,18 +230,28 @@ function startPromoSchedule() {
 }
 
 // ---------------------------------------------------------------------------
-// API Server (for external control)
+// API Server + Live Control Dashboard
 // ---------------------------------------------------------------------------
 function startAPI() {
   const app = express();
   app.use(express.json());
   
-  // Get storyline state
+  // ---------- API Routes ----------
+  
   app.get('/state', (req, res) => {
-    res.json({ ok: true, state: storyline.getState(), messageCount: messageHistory.length });
+    res.json({ ok: true, state: storyline.getState(), messages: messageHistory.length, paused: isPaused });
   });
   
-  // Force a character to speak
+  app.post('/pause', (req, res) => {
+    isPaused = true;
+    res.json({ ok: true, paused: true });
+  });
+  
+  app.post('/resume', (req, res) => {
+    isPaused = false;
+    res.json({ ok: true, paused: false });
+  });
+  
   app.post('/speak', async (req, res) => {
     const { characterId, prompt } = req.body;
     if (!characterId) return res.status(400).json({ error: 'characterId required' });
@@ -293,15 +262,14 @@ function startAPI() {
       messageHistory
     );
     
-    if (response && CONFIG.channelId) {
-      const channel = discordClient?.channels?.cache?.get(CONFIG.channelId);
+    if (response && CONFIG.channelId && discordClient) {
+      const channel = discordClient.channels?.cache?.get(CONFIG.channelId);
       if (channel) await sendAsCharacter(characterId, response, channel);
     }
     
     res.json({ ok: true, character: characterId, response });
   });
   
-  // Trigger surprise entrance
   app.post('/surprise', async (req, res) => {
     const { characterId } = req.body;
     if (characterId && !storyline.getState().activeCharacters.includes(characterId)) {
@@ -317,15 +285,39 @@ function startAPI() {
       messageHistory
     );
     
-    if (response && CONFIG.channelId) {
-      const channel = discordClient?.channels?.cache?.get(CONFIG.channelId);
+    if (response && CONFIG.channelId && discordClient) {
+      const channel = discordClient.channels?.cache?.get(CONFIG.channelId);
       if (channel) await sendAsCharacter(surprise.characterId, response, channel);
     }
     
-    res.json({ ok: true, character: surprise.characterId, response });
+    res.json({ ok: true, character: surprise.characterId, type: surprise.reason, response });
   });
   
-  // Add character to roster
+  app.post('/feud', (req, res) => {
+    const { char1, char2, intensity } = req.body;
+    if (!char1 || !char2) return res.status(400).json({ error: 'char1 and char2 required' });
+    const feud = storyline.createFeud(char1, char2, intensity || 5);
+    res.json({ ok: true, feud });
+  });
+  
+  app.get('/characters', (req, res) => {
+    const chars = {};
+    const state = storyline.getState();
+    for (const [id, char] of Object.entries(CHARACTERS)) {
+      chars[id] = {
+        name: char.name,
+        displayName: char.displayName,
+        alignment: char.alignment,
+        era: char.era,
+        finisher: char.finisher,
+        active: state.activeCharacters.includes(id),
+        inWings: state.waitingInTheWings.includes(id),
+        heat: state.heatMap[id] || 0,
+      };
+    }
+    res.json({ ok: true, characters: chars });
+  });
+  
   app.post('/characters', (req, res) => {
     const { id, active } = req.body;
     if (!id || !getCharacter(id)) return res.status(400).json({ error: 'Unknown character' });
@@ -333,33 +325,298 @@ function startAPI() {
     if (active) {
       if (!storyline.getState().activeCharacters.includes(id)) {
         storyline.activeCharacters.push(id);
+        storyline.waitingInTheWings = storyline.waitingInTheWings.filter(c => c !== id);
       }
     } else {
       storyline.addCharacterToWings(id);
     }
     
+    storyline.saveState().catch(() => {});
     res.json({ ok: true, state: storyline.getState() });
   });
   
-  // List characters
-  app.get('/characters', (req, res) => {
-    const chars = {};
-    for (const [id, char] of Object.entries(CHARACTERS)) {
-      chars[id] = {
-        name: char.name,
-        displayName: char.displayName,
-        alignment: char.alignment,
-        active: storyline.getState().activeCharacters.includes(id),
-        inWings: storyline.getState().waitingInTheWings.includes(id),
-      };
-    }
-    res.json({ ok: true, characters: chars });
+  app.get('/history', (req, res) => {
+    const limit = parseInt(req.query.limit || '50');
+    res.json({ ok: true, messages: messageHistory.slice(-limit) });
+  });
+  
+  // ---------- Live Control Dashboard ----------
+  
+  app.get('/dashboard', (req, res) => {
+    res.setHeader('Content-Type', 'text/html');
+    res.send(DASHBOARD_HTML);
   });
   
   app.listen(CONFIG.apiPort, '0.0.0.0', () => {
-    console.log(`Director API listening on :${CONFIG.apiPort}`);
+    console.log(`Director API + Dashboard on :${CONFIG.apiPort}`);
+    console.log(`Dashboard: http://localhost:${CONFIG.apiPort}/dashboard`);
   });
 }
+
+// ---------------------------------------------------------------------------
+// Dashboard HTML
+// ---------------------------------------------------------------------------
+const DASHBOARD_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>🎤 WWE Director — Live Control</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Segoe UI', sans-serif; background: #0a0a0a; color: #e0e0e0; }
+  
+  .header { background: linear-gradient(135deg, #1a1a2e, #16213e); padding: 20px; text-align: center; border-bottom: 3px solid #e94560; }
+  .header h1 { font-size: 2em; color: #e94560; text-shadow: 0 0 20px rgba(233,69,96,0.5); }
+  .header .status { margin-top: 8px; font-size: 0.9em; color: #aaa; }
+  .header .status .live { color: #4ade80; font-weight: bold; }
+  .header .status .paused { color: #fbbf24; font-weight: bold; }
+  
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 16px; max-width: 1400px; margin: 0 auto; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  
+  .card { background: #1a1a2e; border-radius: 12px; padding: 16px; border: 1px solid #333; }
+  .card h2 { color: #e94560; margin-bottom: 12px; font-size: 1.1em; }
+  
+  .character-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
+  .char-card { background: #16213e; border-radius: 8px; padding: 12px; text-align: center; cursor: pointer; transition: all 0.2s; border: 2px solid transparent; }
+  .char-card:hover { border-color: #e94560; transform: translateY(-2px); }
+  .char-card.active { border-color: #4ade80; }
+  .char-card.wings { border-color: #fbbf24; opacity: 0.7; }
+  .char-card.inactive { opacity: 0.4; }
+  .char-card .name { font-weight: bold; font-size: 1.1em; margin-bottom: 4px; }
+  .char-card .alignment { font-size: 0.8em; color: #aaa; }
+  .char-card .heat { font-size: 0.75em; color: #e94560; margin-top: 4px; }
+  .char-card .status-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.7em; margin-top: 4px; }
+  .char-card .status-badge.active { background: #065f46; color: #4ade80; }
+  .char-card .status-badge.wings { background: #78350f; color: #fbbf24; }
+  
+  .feud-list { list-style: none; }
+  .feud-list li { padding: 8px 12px; margin-bottom: 6px; background: #16213e; border-radius: 6px; display: flex; justify-content: space-between; align-items: center; }
+  .feud-list .vs { color: #e94560; font-weight: bold; margin: 0 8px; }
+  .feud-list .intensity { font-size: 0.85em; }
+  .intensity-bar { width: 100px; height: 8px; background: #333; border-radius: 4px; overflow: hidden; display: inline-block; vertical-align: middle; margin-left: 8px; }
+  .intensity-fill { height: 100%; border-radius: 4px; transition: width 0.3s; }
+  
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .btn { padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; font-size: 0.9em; font-weight: 600; transition: all 0.2s; }
+  .btn:hover { transform: translateY(-1px); }
+  .btn-red { background: #e94560; color: white; }
+  .btn-green { background: #4ade80; color: #0a0a0a; }
+  .btn-yellow { background: #fbbf24; color: #0a0a0a; }
+  .btn-blue { background: #60a5fa; color: #0a0a0a; }
+  
+  .chat-log { max-height: 400px; overflow-y: auto; font-family: monospace; font-size: 0.85em; background: #0f0f1a; border-radius: 8px; padding: 12px; }
+  .chat-log .msg { margin-bottom: 6px; padding: 4px 0; border-bottom: 1px solid #1a1a2e; }
+  .chat-log .msg .author { font-weight: bold; }
+  .chat-log .msg .time { color: #666; font-size: 0.8em; }
+  .chat-log .msg.character { color: #fbbf24; }
+  
+  .input-row { display: flex; gap: 8px; margin-top: 8px; }
+  .input-row select, .input-row input { padding: 8px; border-radius: 6px; border: 1px solid #333; background: #16213e; color: #e0e0e0; flex: 1; }
+  
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 16px; }
+  .stat { text-align: center; padding: 12px; background: #16213e; border-radius: 8px; }
+  .stat .value { font-size: 1.8em; font-weight: bold; color: #e94560; }
+  .stat .label { font-size: 0.8em; color: #aaa; margin-top: 4px; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>🎤 WWE Director — Live Control</h1>
+  <div class="status">Status: <span id="statusText" class="live">LOADING...</span> | Messages: <span id="msgCount">0</span> | Uptime: <span id="uptime">0m</span></div>
+</div>
+
+<div class="grid">
+  <!-- Stats -->
+  <div class="card" style="grid-column: 1 / -1;">
+    <div class="stats">
+      <div class="stat"><div class="value" id="statActive">0</div><div class="label">Active Wrestlers</div></div>
+      <div class="stat"><div class="value" id="statWings">0</div><div class="label">In the Wings</div></div>
+      <div class="stat"><div class="value" id="statFeuds">0</div><div class="label">Active Feuds</div></div>
+      <div class="stat"><div class="value" id="statMessages">0</div><div class="label">Total Messages</div></div>
+    </div>
+    <div class="controls">
+      <button class="btn btn-red" onclick="togglePause()">⏸ Pause/Resume</button>
+      <button class="btn btn-yellow" onclick="triggerSurprise()">💥 Surprise Entrance</button>
+      <button class="btn btn-blue" onclick="refreshState()">🔄 Refresh</button>
+    </div>
+  </div>
+
+  <!-- Characters -->
+  <div class="card">
+    <h2>🤼 Roster</h2>
+    <div id="roster" class="character-grid"></div>
+  </div>
+
+  <!-- Feuds -->
+  <div class="card">
+    <h2>🔥 Active Feuds</h2>
+    <ul id="feudList" class="feud-list"></ul>
+    <div class="input-row" style="margin-top: 12px;">
+      <select id="feudChar1"></select>
+      <span style="padding:8px; color:#e94560; font-weight:bold;">VS</span>
+      <select id="feudChar2"></select>
+      <button class="btn btn-red" onclick="createFeud()">Start Feud</button>
+    </div>
+  </div>
+
+  <!-- Force Speak -->
+  <div class="card">
+    <h2>🎙️ Force Promo</h2>
+    <div class="input-row">
+      <select id="speakChar"></select>
+      <input id="speakPrompt" placeholder="Custom prompt (optional)">
+      <button class="btn btn-green" onclick="forceSpeak()">🗣️ Speak</button>
+    </div>
+    <div id="speakResult" style="margin-top:8px; font-style:italic; color:#aaa;"></div>
+  </div>
+
+  <!-- Recent History -->
+  <div class="card">
+    <h2>📝 Storyline Beats</h2>
+    <div id="storyBeats" style="max-height:200px; overflow-y:auto; font-size:0.85em;"></div>
+  </div>
+
+  <!-- Chat Log -->
+  <div class="card" style="grid-column: 1 / -1;">
+    <h2>💬 Chat Log</h2>
+    <div id="chatLog" class="chat-log"></div>
+  </div>
+</div>
+
+<script>
+const API = '';
+let state = null;
+let characters = null;
+
+async function fetchJSON(url, opts) {
+  const r = await fetch(API + url, opts);
+  return r.json();
+}
+
+async function refreshState() {
+  [state, characters] = await Promise.all([
+    fetchJSON('/state'),
+    fetchJSON('/characters'),
+  ]);
+  render();
+}
+
+function render() {
+  if (!state || !characters) return;
+  const s = state.state;
+  
+  // Status
+  document.getElementById('statusText').textContent = state.paused ? 'PAUSED' : 'LIVE';
+  document.getElementById('statusText').className = state.paused ? 'paused' : 'live';
+  document.getElementById('msgCount').textContent = state.messages;
+  document.getElementById('statActive').textContent = s.activeCharacters.length;
+  document.getElementById('statWings').textContent = s.waitingInTheWings.length;
+  document.getElementById('statFeuds').textContent = s.feuds.length;
+  document.getElementById('statMessages').textContent = s.messageCount;
+  
+  const mins = Math.floor((Date.now() - s.sessionStartedAt) / 60000);
+  document.getElementById('uptime').textContent = mins < 60 ? mins + 'm' : Math.floor(mins/60) + 'h ' + (mins%60) + 'm';
+  
+  // Roster
+  const roster = document.getElementById('roster');
+  roster.innerHTML = '';
+  const charEntries = Object.entries(characters.characters);
+  charEntries.forEach(([id, c]) => {
+    const statusClass = c.active ? 'active' : c.inWings ? 'wings' : 'inactive';
+    const statusLabel = c.active ? 'Active' : c.inWings ? 'In Wings' : 'Inactive';
+    roster.innerHTML += \`<div class="char-card \${statusClass}" onclick="toggleCharacter('\${id}', \${c.active})">
+      <div class="name">\${c.displayName}</div>
+      <div class="alignment">\${c.alignment} · \${c.era}</div>
+      <div class="heat">\${c.heat > 0 ? '🔥'.repeat(Math.min(c.heat, 5)) : ''}</div>
+      <span class="status-badge \${statusClass}">\${statusLabel}</span>
+    </div>\`;
+  });
+  
+  // Feuds
+  const feudList = document.getElementById('feudList');
+  feudList.innerHTML = '';
+  s.feuds.forEach(f => {
+    const pct = (f.intensity / 10) * 100;
+    const color = f.intensity > 7 ? '#ef4444' : f.intensity > 4 ? '#fbbf24' : '#4ade80';
+    feudList.innerHTML += \`<li>
+      <span>\${f.between[0]} <span class="vs">VS</span> \${f.between[1]}</span>
+      <span class="intensity">\${f.intensity.toFixed(1)}/10
+        <span class="intensity-bar"><span class="intensity-fill" style="width:\${pct}%; background:\${color};"></span></span>
+      </span>
+    </li>\`;
+  });
+  
+  // Dropdowns
+  const options = charEntries.map(([id, c]) => \`<option value="\${id}">\${c.name}</option>\`).join('');
+  ['feudChar1','feudChar2','speakChar'].forEach(sel => {
+    document.getElementById(sel).innerHTML = options;
+  });
+  
+  // Story beats
+  const beats = document.getElementById('storyBeats');
+  beats.innerHTML = s.recentHistory.slice(-10).reverse().map(h => 
+    \`<div style="margin-bottom:4px; padding:4px; background:#16213e; border-radius:4px;">
+      <strong>\${h.beat}</strong> — \${h.characters.join(' vs ')}\${h.intensity ? ' (intensity: '+h.intensity+')' : ''}
+    </div>\`
+  ).join('');
+}
+
+async function loadChat() {
+  const data = await fetchJSON('/history?limit=30');
+  const log = document.getElementById('chatLog');
+  log.innerHTML = data.messages.map(m => {
+    const t = new Date(m.timestamp).toLocaleTimeString();
+    const cls = m.isCharacter ? 'msg character' : 'msg';
+    return \`<div class="\${cls}"><span class="time">\${t}</span> <span class="author">\${m.author}:</span> \${m.content}</div>\`;
+  }).join('');
+  log.scrollTop = log.scrollHeight;
+}
+
+async function togglePause() {
+  const action = state?.paused ? '/resume' : '/pause';
+  await fetchJSON(action, { method: 'POST' });
+  refreshState();
+}
+
+async function triggerSurprise() {
+  const r = await fetchJSON('/surprise', { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' });
+  if (r.ok) alert('💥 ' + r.character + ' enters! ' + (r.response || '').slice(0, 100));
+  else alert('No characters in wings');
+  refreshState();
+}
+
+async function forceSpeak() {
+  const charId = document.getElementById('speakChar').value;
+  const prompt = document.getElementById('speakPrompt').value;
+  document.getElementById('speakResult').textContent = 'Generating...';
+  const r = await fetchJSON('/speak', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ characterId: charId, prompt }) });
+  document.getElementById('speakResult').textContent = r.response || 'No response';
+  loadChat();
+}
+
+async function createFeud() {
+  const c1 = document.getElementById('feudChar1').value;
+  const c2 = document.getElementById('feudChar2').value;
+  if (c1 === c2) { alert('Pick two different wrestlers'); return; }
+  await fetchJSON('/feud', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ char1: c1, char2: c2, intensity: 5 }) });
+  refreshState();
+}
+
+async function toggleCharacter(id, isActive) {
+  await fetchJSON('/characters', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id, active: !isActive }) });
+  refreshState();
+}
+
+// Auto-refresh
+refreshState();
+loadChat();
+setInterval(refreshState, 5000);
+setInterval(loadChat, 8000);
+</script>
+</body>
+</html>`;
 
 // ---------------------------------------------------------------------------
 // Utilities
@@ -376,9 +633,16 @@ async function main() {
   console.log(`Characters: ${listCharacters().join(', ')}`);
   console.log(`Model: ${CONFIG.model}`);
   
+  // Load persisted storyline state
+  await storyline.loadState();
+  
   startAPI();
   await startDiscord();
   startPromoSchedule();
+  
+  // Save state on exit
+  process.on('SIGTERM', async () => { await storyline.saveState(); process.exit(0); });
+  process.on('SIGINT', async () => { await storyline.saveState(); process.exit(0); });
   
   console.log('🎤 Director is LIVE. The show has begun.');
 }

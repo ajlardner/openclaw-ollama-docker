@@ -208,12 +208,15 @@ services:
       DIRECTOR_PORT: "9091"
       RESPONSE_DELAY_MS: ${RESPONSE_DELAY_MS:-3000}
       PROMO_INTERVAL_MIN: ${PROMO_INTERVAL_MIN:-30}
+      STATE_DIR: /data/storyline
       HTTP_PROXY: http://discord-proxy:3128
       HTTPS_PROXY: http://discord-proxy:3128
       http_proxy: http://discord-proxy:3128
       https_proxy: http://discord-proxy:3128
       NO_PROXY: ollama,ollama-gpu,localhost,127.0.0.1,spawn-controller
       no_proxy: ollama,ollama-gpu,localhost,127.0.0.1,spawn-controller
+    volumes:
+      - ./data/storyline:/data/storyline
     ports:
       - "${DIRECTOR_PORT:-9091}:9091"
     networks:
