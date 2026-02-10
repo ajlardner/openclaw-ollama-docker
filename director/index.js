@@ -16,6 +16,7 @@ import { CHARACTERS, getCharacter, listCharacters, getAllFeuds } from './charact
 import { StorylineEngine } from './storyline-engine.js';
 import { ChampionshipTracker, CHAMPIONSHIPS } from './championships.js';
 import { ANNOUNCERS, getAnnouncerReactions, buildAnnouncerPrompt } from './announcers.js';
+import { MatchEngine, MATCH_TYPES } from './match-engine.js';
 
 // ---------------------------------------------------------------------------
 // Config
@@ -39,6 +40,7 @@ const CONFIG = {
 // ---------------------------------------------------------------------------
 const storyline = new StorylineEngine();
 const championships = new ChampionshipTracker();
+const matchEngine = new MatchEngine();
 let webhookClient = null;
 let discordClient = null;
 const messageHistory = [];
@@ -396,6 +398,43 @@ function startAPI() {
     res.json({ ok: true });
   });
   
+  // ---------- Match Routes ----------
+
+  app.get('/matches', (req, res) => {
+    res.json({ ok: true, ...matchEngine.getState() });
+  });
+
+  app.post('/matches/simulate', async (req, res) => {
+    const { participants, matchType, forTitle } = req.body;
+    if (!participants || participants.length < 2) {
+      return res.status(400).json({ error: 'Need at least 2 participants' });
+    }
+
+    const result = matchEngine.simulateFullMatch(participants, matchType || 'singles', { forTitle });
+    if (result.error) return res.status(400).json(result);
+
+    // If for a title, award it to the winner
+    if (forTitle && result.match.winner) {
+      const titleResult = championships.awardTitle(forTitle, result.match.winner, result.match.winMethod);
+      result.titleChange = titleResult;
+      storyline.championshipData = championships.toJSON();
+    }
+
+    // Save match data with storyline
+    storyline.matchData = matchEngine.toJSON();
+    await storyline.saveState();
+
+    // Post match results to Discord
+    if (CONFIG.channelId && discordClient) {
+      const channel = discordClient.channels?.cache?.get(CONFIG.channelId);
+      if (channel) {
+        await postMatchToDiscord(result, channel);
+      }
+    }
+
+    res.json({ ok: true, result });
+  });
+
   app.get('/history', (req, res) => {
     const limit = parseInt(req.query.limit || '50');
     res.json({ ok: true, messages: messageHistory.slice(-limit) });
@@ -533,6 +572,29 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Match Simulator -->
+  <div class="card">
+    <h2>🤼 Book a Match</h2>
+    <div class="input-row">
+      <select id="matchChar1"></select>
+      <span style="padding:8px; color:#e94560; font-weight:bold;">VS</span>
+      <select id="matchChar2"></select>
+    </div>
+    <div class="input-row">
+      <select id="matchType">
+        <option value="singles">Singles</option>
+        <option value="no-dq">No DQ</option>
+        <option value="steel-cage">Steel Cage</option>
+        <option value="hell-in-a-cell">Hell in a Cell</option>
+        <option value="ladder">Ladder</option>
+      </select>
+      <select id="matchTitle"><option value="">No Title</option></select>
+      <button class="btn btn-red" onclick="bookMatch()">🔔 BOOK IT!</button>
+    </div>
+    <div id="matchResult" style="margin-top:8px; font-style:italic; color:#aaa;"></div>
+    <div id="matchHistory" style="margin-top:12px; max-height:150px; overflow-y:auto; font-size:0.85em;"></div>
+  </div>
+
   <!-- Force Speak -->
   <div class="card">
     <h2>🎙️ Force Promo</h2>
@@ -570,10 +632,11 @@ async function fetchJSON(url, opts) {
 let champData = null;
 
 async function refreshState() {
-  [state, characters, champData] = await Promise.all([
+  [state, characters, champData, window._matchData] = await Promise.all([
     fetchJSON('/state'),
     fetchJSON('/characters'),
     fetchJSON('/championships'),
+    fetchJSON('/matches'),
   ]);
   render();
 }
@@ -625,7 +688,7 @@ function render() {
   
   // Dropdowns
   const options = charEntries.map(([id, c]) => \`<option value="\${id}">\${c.name}</option>\`).join('');
-  ['feudChar1','feudChar2','speakChar','champChar'].forEach(sel => {
+  ['feudChar1','feudChar2','speakChar','champChar','matchChar1','matchChar2'].forEach(sel => {
     document.getElementById(sel).innerHTML = options;
   });
   
@@ -644,6 +707,24 @@ function render() {
     // Championship dropdowns
     const titleOpts = Object.entries(champData.championships).map(([id, c]) => \`<option value="\${id}">\${c.name}</option>\`).join('');
     document.getElementById('champTitle').innerHTML = titleOpts;
+  }
+
+  // Match title dropdown
+  if (champData?.championships) {
+    const matchTitleSel = document.getElementById('matchTitle');
+    matchTitleSel.innerHTML = '<option value="">No Title</option>' + 
+      Object.entries(champData.championships).map(([id, c]) => \`<option value="\${id}">\${c.name}</option>\`).join('');
+  }
+
+  // Match history
+  if (window._matchData?.recentMatches) {
+    document.getElementById('matchHistory').innerHTML = window._matchData.recentMatches.slice(-5).reverse().map(m => {
+      const names = m.participants.map(p => characters?.characters[p]?.name || p);
+      const winner = characters?.characters[m.winner]?.name || m.winner;
+      return \`<div style="padding:4px; margin-bottom:4px; background:#16213e; border-radius:4px;">
+        <strong>\${names.join(' vs ')}</strong> — 🏆 \${winner} (${''}\${m.winMethod}, \${m.rounds} rds)
+      </div>\`;
+    }).join('');
   }
 
   // Story beats
@@ -696,6 +777,23 @@ async function createFeud() {
   refreshState();
 }
 
+async function bookMatch() {
+  const c1 = document.getElementById('matchChar1').value;
+  const c2 = document.getElementById('matchChar2').value;
+  if (c1 === c2) { alert('Pick two different wrestlers'); return; }
+  const matchType = document.getElementById('matchType').value;
+  const forTitle = document.getElementById('matchTitle').value || undefined;
+  document.getElementById('matchResult').textContent = 'Simulating match...';
+  const r = await fetchJSON('/matches/simulate', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ participants: [c1, c2], matchType, forTitle }) });
+  if (r.ok) {
+    const winner = characters?.characters[r.result.match.winner]?.name || r.result.match.winner;
+    document.getElementById('matchResult').textContent = '🏆 Winner: ' + winner + ' (' + r.result.match.winMethod + ', ' + r.result.rounds.length + ' rounds)';
+  } else {
+    document.getElementById('matchResult').textContent = 'Error: ' + (r.error || 'unknown');
+  }
+  refreshState();
+}
+
 async function awardTitle() {
   const titleId = document.getElementById('champTitle').value;
   const characterId = document.getElementById('champChar').value;
@@ -717,6 +815,100 @@ setInterval(loadChat, 8000);
 </script>
 </body>
 </html>`;
+
+// ---------------------------------------------------------------------------
+// Match Broadcast
+// ---------------------------------------------------------------------------
+async function postMatchToDiscord(result, channel) {
+  const match = result.match;
+  const type = match.typeEmoji || '🤼';
+  const winnerChar = getCharacter(match.winner);
+  
+  // Opening card
+  const participantNames = match.participants.map(p => getCharacter(p)?.displayName || p).join(' vs ');
+  const opener = `${type} **${match.typeName || 'MATCH'}**\n${participantNames}\n${match.forTitle ? `*For the ${match.forTitle}*\n` : ''}🔔 **DING DING DING!**`;
+  
+  if (webhookClient) {
+    await webhookClient.send({ content: opener, username: '📢 Ring Announcer' });
+  } else {
+    await channel.send(opener);
+  }
+
+  // Post key rounds (not all — just highlights)
+  const highlights = result.rounds.filter(r => 
+    ['near-fall', 'finisher-attempt', 'finisher-counter', 'near-fall-kickout', 
+     'comeback', 'weapon-shot', 'ref-bump', 'outside-brawl'].includes(r.beat) || r.isFinish
+  ).slice(-4); // Last 4 highlights max
+
+  for (const round of highlights) {
+    await sleep(2500 + Math.random() * 2000);
+    const prompt = matchEngine.buildRoundPrompt(round);
+    if (prompt) {
+      if (webhookClient) {
+        await webhookClient.send({ content: `> ${prompt.narrative}`, username: '📢 Ring Announcer' });
+      } else {
+        await channel.send(`> ${prompt.narrative}`);
+      }
+    }
+  }
+
+  // Final result
+  await sleep(2000);
+  const winMethod = match.winMethod === 'pinfall' ? 'by pinfall' : 
+    match.winMethod === 'submission' ? 'by submission' :
+    match.winMethod === 'count-out' ? 'by count-out' :
+    `by ${match.winMethod}`;
+  
+  const resultMsg = `🏆 **YOUR WINNER: ${winnerChar?.displayName || match.winner}!** (${winMethod} in ${result.rounds.length} rounds)`;
+  if (webhookClient) {
+    await webhookClient.send({ content: resultMsg, username: '📢 Ring Announcer' });
+  } else {
+    await channel.send(resultMsg);
+  }
+
+  // Title change announcement
+  if (result.titleChange) {
+    await sleep(1500);
+    const titleMsg = `👑 **NEW ${result.titleChange.titleName.toUpperCase()} CHAMPION: ${winnerChar?.displayName || match.winner}!**`;
+    if (webhookClient) {
+      await webhookClient.send({ content: titleMsg, username: '📢 Ring Announcer' });
+    } else {
+      await channel.send(titleMsg);
+    }
+  }
+
+  // Announcer commentary on the finish
+  triggerAnnouncerCommentary(
+    result.titleChange ? 'title-change' : 'feud-escalation',
+    `${winnerChar?.name} just defeated ${match.participants.filter(p => p !== match.winner).map(p => getCharacter(p)?.name || p).join(' and ')} in a ${match.typeName}!`,
+    channel
+  );
+
+  // Winner reacts
+  await sleep(3000);
+  const winnerResponse = await generateResponse(
+    { characterId: match.winner, context: `You just WON a ${match.typeName} ${winMethod}! ${result.titleChange ? 'AND you are the NEW champion!' : ''} Celebrate!`, reason: 'match-win' },
+    'The bell rings. The match is over.',
+    messageHistory
+  );
+  if (winnerResponse) {
+    await sendAsCharacter(match.winner, winnerResponse, channel);
+  }
+
+  // Loser reacts
+  const loser = match.participants.find(p => p !== match.winner);
+  if (loser) {
+    await sleep(2500);
+    const loserResponse = await generateResponse(
+      { characterId: loser, context: `You just LOST a ${match.typeName} ${winMethod}. ${result.titleChange ? 'You lost your title!' : ''} React.`, reason: 'match-loss' },
+      'The bell rings. The match is over.',
+      messageHistory
+    );
+    if (loserResponse) {
+      await sendAsCharacter(loser, loserResponse, channel);
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Announcer Commentary
@@ -776,10 +968,14 @@ async function main() {
   // Load persisted storyline state
   await storyline.loadState();
   
-  // Load championship state if saved
+  // Load championship + match state if saved
   if (storyline.championshipData) {
     championships.loadFrom(storyline.championshipData);
     console.log('Loaded championship state');
+  }
+  if (storyline.matchData) {
+    matchEngine.loadFrom(storyline.matchData);
+    console.log(`Loaded match history: ${matchEngine.matchHistory.length} matches`);
   }
   
   startAPI();
