@@ -338,8 +338,7 @@ export class MatchEngine {
   }
 
   _pickCombatants(alive) {
-    if (alive.length === 2) return [alive[0], alive[1]];
-    // Random pair
+    // Always randomize who's the actor to prevent first-mover advantage
     const shuffled = [...alive].sort(() => Math.random() - 0.5);
     return [shuffled[0], shuffled[1]];
   }
