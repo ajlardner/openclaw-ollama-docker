@@ -182,6 +182,44 @@ services:
       retries: 3
 
   # ===========================================================================
+  # WWE Director — Character management, storylines, webhook posting
+  # ===========================================================================
+  # The "booker" — reads Discord messages, decides which wrestlers respond,
+  # generates responses via Ollama, posts via webhook as characters.
+  # Only needs ONE Discord bot token for unlimited characters.
+  director:
+    build: ./director
+    container_name: wwe-director
+    restart: unless-stopped
+    profiles:
+      - wwe
+    depends_on:
+      ollama:
+        condition: service_healthy
+      discord-proxy:
+        condition: service_healthy
+    environment:
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
+      DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
+      DISCORD_CHANNEL_ID: ${DISCORD_CHANNEL_ID:-}
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: ${DEFAULT_MODEL:-qwen3-coder}
+      DIRECTOR_PORT: "9091"
+      RESPONSE_DELAY_MS: ${RESPONSE_DELAY_MS:-3000}
+      PROMO_INTERVAL_MIN: ${PROMO_INTERVAL_MIN:-30}
+      HTTP_PROXY: http://discord-proxy:3128
+      HTTPS_PROXY: http://discord-proxy:3128
+      http_proxy: http://discord-proxy:3128
+      https_proxy: http://discord-proxy:3128
+      NO_PROXY: ollama,ollama-gpu,localhost,127.0.0.1,spawn-controller
+      no_proxy: ollama,ollama-gpu,localhost,127.0.0.1,spawn-controller
+    ports:
+      - "${DIRECTOR_PORT:-9091}:9091"
+    networks:
+      - internal
+
+  # ===========================================================================
   # Ollama Admin — Host-accessible Ollama API for model management
   # ===========================================================================
   # Since Ollama is on an internal network, this sidecar exposes the API

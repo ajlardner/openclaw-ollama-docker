@@ -1,0 +1,11 @@
+{
+  "name": "wwe-director",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "WWE Discord agent director — manages characters, storylines, and webhook posting",
+  "main": "index.js",
+  "dependencies": {
+    "discord.js": "^14.16.0",
+    "express": "^4.18.0"
+  }
+}

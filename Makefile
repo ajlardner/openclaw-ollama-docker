@@ -228,6 +228,35 @@ transcript: ## Export experiment transcript (usage: make transcript [FMT=markdow
 	@bash scripts/export-transcript.sh $(if $(FMT),--format $(FMT),) $(if $(OUT),--output $(OUT),)
 
 # ---------------------------------------------------------------------------
+# WWE Director
+# ---------------------------------------------------------------------------
+
+wwe-up: ## Start the WWE director (usage: make wwe-up)
+	$(COMPOSE) --profile wwe $(PROFILE) up -d
+
+wwe-down: ## Stop the WWE director
+	$(COMPOSE) --profile wwe down
+
+wwe-logs: ## Tail WWE director logs
+	$(COMPOSE) logs -f director
+
+wwe-state: ## Show current WWE storyline state
+	@curl -sf http://localhost:9091/state | jq .
+
+wwe-characters: ## List all WWE characters and their status
+	@curl -sf http://localhost:9091/characters | jq .
+
+wwe-speak: ## Make a character speak (usage: make wwe-speak CHAR=the-rock PROMPT="Cut a promo")
+	@curl -sf -X POST http://localhost:9091/speak \
+		-H "Content-Type: application/json" \
+		-d '{"characterId":"$(CHAR)","prompt":"$(PROMPT)"}' | jq .
+
+wwe-surprise: ## Trigger a surprise entrance (usage: make wwe-surprise [CHAR=stone-cold])
+	@curl -sf -X POST http://localhost:9091/surprise \
+		-H "Content-Type: application/json" \
+		-d '{"characterId":"$(CHAR)"}' | jq .
+
+# ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
 
