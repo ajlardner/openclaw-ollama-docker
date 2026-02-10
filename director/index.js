@@ -17,6 +17,7 @@ import { StorylineEngine } from './storyline-engine.js';
 import { ChampionshipTracker, CHAMPIONSHIPS } from './championships.js';
 import { ANNOUNCERS, getAnnouncerReactions, buildAnnouncerPrompt } from './announcers.js';
 import { MatchEngine, MATCH_TYPES } from './match-engine.js';
+import { PPVEngine, PPV_TEMPLATES } from './ppv-engine.js';
 
 // ---------------------------------------------------------------------------
 // Config
@@ -41,6 +42,7 @@ const CONFIG = {
 const storyline = new StorylineEngine();
 const championships = new ChampionshipTracker();
 const matchEngine = new MatchEngine();
+const ppvEngine = new PPVEngine();
 let webhookClient = null;
 let discordClient = null;
 const messageHistory = [];
@@ -435,6 +437,52 @@ function startAPI() {
     res.json({ ok: true, result });
   });
 
+  // ---------- PPV Routes ----------
+
+  app.get('/ppv', (req, res) => {
+    res.json({ ok: true, ...ppvEngine.getState() });
+  });
+
+  app.post('/ppv/schedule', async (req, res) => {
+    const { templateId, name, scheduledAt } = req.body;
+    if (!templateId) return res.status(400).json({ error: 'templateId required' });
+    const event = ppvEngine.scheduleEvent(templateId, { name, scheduledAt });
+    if (event.error) return res.status(400).json(event);
+    storyline.ppvData = ppvEngine.toJSON();
+    await storyline.saveState();
+    res.json({ ok: true, event });
+  });
+
+  app.post('/ppv/:eventId/add-match', async (req, res) => {
+    const { participants, matchType, forTitle, isMainEvent } = req.body;
+    if (!participants || participants.length < 2) return res.status(400).json({ error: 'Need participants' });
+    const result = ppvEngine.addMatch(req.params.eventId, { participants, matchType, forTitle, isMainEvent });
+    if (result.error) return res.status(400).json(result);
+    storyline.ppvData = ppvEngine.toJSON();
+    await storyline.saveState();
+    res.json({ ok: true, match: result });
+  });
+
+  app.post('/ppv/:eventId/auto-book', async (req, res) => {
+    const event = ppvEngine.scheduledEvents.find(e => e.id === req.params.eventId);
+    if (!event) return res.status(404).json({ error: 'Event not found' });
+    const card = ppvEngine.autoBookCard(event, storyline.feuds, storyline.activeCharacters, championships);
+    event.matchCard = card;
+    storyline.ppvData = ppvEngine.toJSON();
+    await storyline.saveState();
+    res.json({ ok: true, card });
+  });
+
+  app.post('/ppv/:eventId/run', async (req, res) => {
+    const event = ppvEngine.startEvent(req.params.eventId);
+    if (event.error) return res.status(400).json(event);
+
+    res.json({ ok: true, message: 'PPV started! Matches will play out in Discord.', event });
+
+    // Run the PPV in the background
+    runPPV(event).catch(err => console.error('PPV error:', err));
+  });
+
   app.get('/history', (req, res) => {
     const limit = parseInt(req.query.limit || '50');
     res.json({ ok: true, messages: messageHistory.slice(-limit) });
@@ -612,6 +660,16 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <div id="storyBeats" style="max-height:200px; overflow-y:auto; font-size:0.85em;"></div>
   </div>
 
+  <!-- PPV Events -->
+  <div class="card" style="grid-column: 1 / -1;">
+    <h2>🎆 Pay-Per-View Events</h2>
+    <div class="controls">
+      <select id="ppvTemplate"></select>
+      <button class="btn btn-red" onclick="schedulePPV()">📅 Schedule PPV</button>
+    </div>
+    <div id="ppvList" style="margin-top:12px;"></div>
+  </div>
+
   <!-- Chat Log -->
   <div class="card" style="grid-column: 1 / -1;">
     <h2>💬 Chat Log</h2>
@@ -631,12 +689,15 @@ async function fetchJSON(url, opts) {
 
 let champData = null;
 
+let ppvData = null;
+
 async function refreshState() {
-  [state, characters, champData, window._matchData] = await Promise.all([
+  [state, characters, champData, window._matchData, ppvData] = await Promise.all([
     fetchJSON('/state'),
     fetchJSON('/characters'),
     fetchJSON('/championships'),
     fetchJSON('/matches'),
+    fetchJSON('/ppv'),
   ]);
   render();
 }
@@ -709,6 +770,44 @@ function render() {
     document.getElementById('champTitle').innerHTML = titleOpts;
   }
 
+  // PPV section
+  if (ppvData) {
+    const ppvTemplateSelect = document.getElementById('ppvTemplate');
+    if (ppvData.templates) {
+      ppvTemplateSelect.innerHTML = ppvData.templates.map(t => 
+        \`<option value="\${t.id}">\${t.emoji} \${t.name}</option>\`
+      ).join('');
+    }
+    
+    const ppvList = document.getElementById('ppvList');
+    let ppvHtml = '';
+    
+    if (ppvData.active) {
+      ppvHtml += \`<div style="padding:12px; background:#1a0a0a; border:2px solid #e94560; border-radius:8px; margin-bottom:8px;">
+        <strong style="color:#e94560;">🔴 LIVE: \${ppvData.active.emoji} \${ppvData.active.name}</strong>
+        <div style="color:#aaa; font-size:0.85em;">\${ppvData.active.matchCard.length} matches · \${ppvData.active.results?.length || 0} completed</div>
+      </div>\`;
+    }
+    
+    for (const evt of (ppvData.scheduled || [])) {
+      ppvHtml += \`<div style="padding:10px; background:#16213e; border-radius:8px; margin-bottom:6px; display:flex; justify-content:space-between; align-items:center;">
+        <div><strong>\${evt.emoji} \${evt.name}</strong> <span style="color:#aaa;">(\${evt.matchCard.length} matches)</span></div>
+        <button class="btn btn-green" onclick="runPPVEvent('\${evt.id}')" style="padding:4px 12px; font-size:0.8em;">▶ RUN</button>
+      </div>\`;
+    }
+    
+    if ((ppvData.completed || []).length > 0) {
+      ppvHtml += '<div style="margin-top:8px; color:#666; font-size:0.85em;">Recent:</div>';
+      for (const evt of (ppvData.completed || []).slice(-3).reverse()) {
+        ppvHtml += \`<div style="padding:6px; background:#0f0f1a; border-radius:4px; margin-bottom:4px; font-size:0.85em; color:#aaa;">
+          \${evt.emoji} \${evt.name} — \${evt.results?.length || 0} matches
+        </div>\`;
+      }
+    }
+    
+    ppvList.innerHTML = ppvHtml || '<div style="color:#666;">No events scheduled</div>';
+  }
+
   // Match title dropdown
   if (champData?.championships) {
     const matchTitleSel = document.getElementById('matchTitle');
@@ -777,6 +876,25 @@ async function createFeud() {
   refreshState();
 }
 
+async function schedulePPV() {
+  const templateId = document.getElementById('ppvTemplate').value;
+  const r = await fetchJSON('/ppv/schedule', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ templateId }) });
+  if (r.ok) {
+    // Auto-book the card
+    await fetchJSON('/ppv/' + r.event.id + '/auto-book', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
+    alert(r.event.emoji + ' ' + r.event.name + ' scheduled! Card auto-booked.');
+  }
+  refreshState();
+}
+
+async function runPPVEvent(eventId) {
+  if (!confirm('Start this PPV? Matches will play out in Discord.')) return;
+  const r = await fetchJSON('/ppv/' + eventId + '/run', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
+  if (r.ok) alert('PPV STARTED! Check Discord.');
+  else alert('Error: ' + (r.error || 'unknown'));
+  refreshState();
+}
+
 async function bookMatch() {
   const c1 = document.getElementById('matchChar1').value;
   const c2 = document.getElementById('matchChar2').value;
@@ -815,6 +933,108 @@ setInterval(loadChat, 8000);
 </script>
 </body>
 </html>`;
+
+// ---------------------------------------------------------------------------
+// PPV Runner
+// ---------------------------------------------------------------------------
+async function runPPV(event) {
+  const channel = discordClient?.channels?.cache?.get(CONFIG.channelId);
+  if (!channel && !webhookClient) {
+    console.error('No channel or webhook for PPV broadcast');
+    ppvEngine.completeEvent();
+    return;
+  }
+
+  const send = async (content, username = '📢 Ring Announcer') => {
+    if (webhookClient) {
+      await webhookClient.send({ content, username });
+    } else if (channel) {
+      await channel.send(content);
+    }
+  };
+
+  // Pre-show hype
+  const hypeMessages = ppvEngine.buildHypeMessages(event);
+  for (const msg of hypeMessages) {
+    await send(msg);
+    await sleep(2000);
+  }
+
+  await sleep(5000);
+  await send(`\n🔔 **THE SHOW IS ABOUT TO BEGIN!** 🔔\n${'═'.repeat(30)}`);
+  await sleep(3000);
+
+  // Run each match
+  for (const matchEntry of event.matchCard) {
+    await sleep(4000);
+
+    // Match intro
+    const names = matchEntry.participants.map(p => getCharacter(p)?.displayName || p);
+    const typeLabel = matchEntry.matchType !== 'singles' ? ` [${matchEntry.matchType.toUpperCase()}]` : '';
+    const titleLabel = matchEntry.forTitle ? ` for the ${matchEntry.forTitle}` : '';
+    const mainLabel = matchEntry.isMainEvent ? '\n🌟 **THIS IS YOUR MAIN EVENT OF THE EVENING!** 🌟' : '';
+
+    await send(`\n${'─'.repeat(30)}\n**MATCH ${matchEntry.order}${typeLabel}${titleLabel}**\n${names.join(' vs ')}${mainLabel}`);
+    await sleep(3000);
+
+    // Entrances
+    for (const p of matchEntry.participants) {
+      const char = getCharacter(p);
+      if (char?.entranceMusic) {
+        await send(`${char.entranceMusic}`);
+        await sleep(2000);
+      }
+    }
+
+    // Simulate the match
+    const result = matchEngine.simulateFullMatch(
+      matchEntry.participants,
+      matchEntry.matchType,
+      { forTitle: matchEntry.forTitle }
+    );
+
+    if (result.error) {
+      await send(`⚠️ Match error: ${result.error}`);
+      continue;
+    }
+
+    // Post match to Discord
+    await postMatchToDiscord(result, channel);
+
+    // Handle title change
+    if (matchEntry.forTitle && result.match.winner) {
+      const titleResult = championships.awardTitle(matchEntry.forTitle, result.match.winner, result.match.winMethod);
+      result.titleChange = titleResult;
+    }
+
+    // Record result in PPV
+    ppvEngine.recordMatchResult(matchEntry.order, {
+      winner: result.match.winner,
+      winMethod: result.match.winMethod,
+      rounds: result.rounds.length,
+      titleChange: !!result.titleChange,
+    });
+
+    // Pause between matches
+    await sleep(6000);
+  }
+
+  // Event complete
+  const completed = ppvEngine.completeEvent();
+  if (completed) {
+    await sleep(3000);
+    const summary = ppvEngine.buildResultsSummary(completed);
+    await send(`\n${'═'.repeat(30)}\n${summary}`);
+  }
+
+  // Save all state
+  storyline.ppvData = ppvEngine.toJSON();
+  storyline.championshipData = championships.toJSON();
+  storyline.matchData = matchEngine.toJSON();
+  await storyline.saveState();
+
+  console.log(`PPV ${event.name} completed!`);
+}
 
 // ---------------------------------------------------------------------------
 // Match Broadcast
@@ -976,6 +1196,10 @@ async function main() {
   if (storyline.matchData) {
     matchEngine.loadFrom(storyline.matchData);
     console.log(`Loaded match history: ${matchEngine.matchHistory.length} matches`);
+  }
+  if (storyline.ppvData) {
+    ppvEngine.loadFrom(storyline.ppvData);
+    console.log(`Loaded PPV data: ${ppvEngine.scheduledEvents.length} scheduled, ${ppvEngine.completedEvents.length} completed`);
   }
   
   startAPI();
