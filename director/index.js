@@ -17,6 +17,7 @@ import { StorylineEngine } from './storyline-engine.js';
 import { ChampionshipTracker, CHAMPIONSHIPS } from './championships.js';
 import { ANNOUNCERS, getAnnouncerReactions, buildAnnouncerPrompt } from './announcers.js';
 import { MatchEngine, MATCH_TYPES } from './match-engine.js';
+import { getCharacterChant, getMatchReaction, getDuelingChant, shouldCrowdReact } from './crowd.js';
 import { PPVEngine, PPV_TEMPLATES } from './ppv-engine.js';
 
 // ---------------------------------------------------------------------------
@@ -107,10 +108,21 @@ async function startDiscord() {
       
       await sendAsCharacter(responder.characterId, response, message.channel);
       
-      // Trigger announcer commentary for dramatic moments
+      // Trigger announcer commentary + crowd reaction for dramatic moments
       if (responder.isSurprise) {
         const char = getCharacter(responder.characterId);
         triggerAnnouncerCommentary(responder.reason, `${char?.name || responder.characterId} just appeared!`, message.channel);
+        if (shouldCrowdReact('entrance')) {
+          const chant = getCharacterChant(responder.characterId) || getMatchReaction('entrance');
+          if (chant) {
+            await sleep(1500);
+            if (webhookClient) {
+              await webhookClient.send({ content: chant, username: '👥 The Crowd' });
+            } else {
+              await message.channel.send(chant);
+            }
+          }
+        }
       }
     }
   });
@@ -1072,6 +1084,19 @@ async function postMatchToDiscord(result, channel) {
     }
   }
 
+  // Crowd reaction after big moments
+  if (shouldCrowdReact('awesome') && highlights.length >= 3) {
+    await sleep(1500);
+    const reaction = getMatchReaction('awesome');
+    if (reaction) {
+      if (webhookClient) {
+        await webhookClient.send({ content: reaction, username: '👥 The Crowd' });
+      } else if (channel) {
+        await channel.send(reaction);
+      }
+    }
+  }
+
   // Final result
   await sleep(2000);
   const winMethod = match.winMethod === 'pinfall' ? 'by pinfall' : 
@@ -1094,6 +1119,18 @@ async function postMatchToDiscord(result, channel) {
       await webhookClient.send({ content: titleMsg, username: '📢 Ring Announcer' });
     } else {
       await channel.send(titleMsg);
+    }
+    // Crowd goes wild for title change
+    if (shouldCrowdReact('titleChange')) {
+      await sleep(1000);
+      const crowdReaction = getMatchReaction('titleChange');
+      if (crowdReaction) {
+        if (webhookClient) {
+          await webhookClient.send({ content: crowdReaction, username: '👥 The Crowd' });
+        } else if (channel) {
+          await channel.send(crowdReaction);
+        }
+      }
     }
   }
 
