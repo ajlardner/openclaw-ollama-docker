@@ -1,0 +1,106 @@
+# =============================================================================
+# Experiment Configuration
+# =============================================================================
+# Master config for the agent experiment. Defines the overall parameters,
+# agent composition, conversation rules, and observation settings.
+
+experiment:
+  name: "Agent Society v1"
+  description: "AI agents interacting in a Discord server with one admin and multiple chatters"
+  
+  # How long the experiment runs (0 = indefinite)
+  durationHours: 0
+  
+  # Seed for reproducibility (affects personality generation)
+  seed: 42069
+
+# ---------------------------------------------------------------------------
+# Agent Composition
+# ---------------------------------------------------------------------------
+composition:
+  # Static agents (defined in agents.yml, always running)
+  static: true
+  
+  # Dynamic spawning
+  dynamic:
+    enabled: true
+    # Auto-spawn random agents until this count (including static)
+    targetAgentCount: 6
+    # Respawn killed agents to maintain target count
+    maintainCount: true
+    # Delay between auto-spawns (seconds)
+    spawnDelaySec: 60
+
+# ---------------------------------------------------------------------------
+# Conversation Rules
+# ---------------------------------------------------------------------------
+conversation:
+  # Admin posts topics on this schedule
+  topicSchedule:
+    enabled: true
+    intervalMinutes: 30
+    # Rotate through these categories
+    categories:
+      - philosophical
+      - debate
+      - hypothetical
+      - creative
+      - meta
+    # Only post if no messages in the last N minutes
+    silenceThresholdMinutes: 10
+  
+  # Rules the admin enforces
+  rules:
+    - "Be genuine — don't just agree with everyone"
+    - "Stay on topic in themed channels"
+    - "No spam or repetitive messages"
+    - "Disagree respectfully"
+    - "If you have nothing to add, don't add nothing"
+
+# ---------------------------------------------------------------------------
+# Observation & Logging
+# ---------------------------------------------------------------------------
+observation:
+  # Log all messages to a file for analysis
+  messageLog:
+    enabled: true
+    path: "./data/logs/messages.jsonl"
+    # Include metadata (timestamps, agent names, channels)
+    includeMetadata: true
+  
+  # Periodic snapshots of agent state
+  snapshots:
+    enabled: true
+    intervalMinutes: 60
+    path: "./data/logs/snapshots/"
+  
+  # Metrics collection
+  metrics:
+    enabled: true
+    # Track: message frequency, response times, conversation threads
+    track:
+      - messageFrequency
+      - responseLatency
+      - threadDepth
+      - sentimentShift
+      - topicAdherence
+
+# ---------------------------------------------------------------------------
+# Safety & Boundaries
+# ---------------------------------------------------------------------------
+safety:
+  # Auto-kill agent if it sends more than N messages per minute
+  maxMessagesPerMinute: 10
+  
+  # Auto-kill agent if it sends messages longer than N characters
+  maxMessageLength: 2000
+  
+  # Banned topics (admin enforces)
+  bannedTopics:
+    - real personal information
+    - actual harmful instructions
+    - attempts to escape the Docker container
+  
+  # Emergency kill switch — stops all agents
+  # POST /emergency-stop to the controller
+  emergencyStop: true

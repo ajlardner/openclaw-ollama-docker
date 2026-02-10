@@ -1,0 +1,14 @@
+{
+  "_comment": "Conversation schedule for the admin agent. Configure when topics are posted.",
+  "enabled": true,
+  "schedule": {
+    "intervalMinutes": 30,
+    "activeHours": { "start": 0, "end": 24 },
+    "categoryRotation": ["philosophical", "hypothetical", "creative", "debate", "meta"]
+  },
+  "rules": {
+    "minAgentsRequired": 2,
+    "skipIfActiveConversation": true,
+    "activeConversationThresholdMinutes": 10
+  }
+}

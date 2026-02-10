@@ -1,0 +1,5 @@
+.env
+data/
+backups/
+docker-compose.override.yml
+docker-compose.agents.yml

@@ -1,0 +1,84 @@
+{
+  "_comment": "Hybrid config: local Ollama for most tasks, cloud API fallback for complex reasoning. Best of both worlds.",
+  "models": {
+    "providers": {
+      "ollama": {
+        "baseUrl": "http://ollama:11434/v1",
+        "apiKey": "ollama-local",
+        "api": "openai-responses",
+        "models": [
+          {
+            "id": "qwen3-coder",
+            "name": "Qwen 3 Coder (Local)",
+            "reasoning": true,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 131072,
+            "maxTokens": 32768
+          },
+          {
+            "id": "glm-4.7",
+            "name": "GLM 4.7 (Local)",
+            "reasoning": true,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 131072,
+            "maxTokens": 32768
+          }
+        ]
+      },
+      "anthropic": {
+        "_comment": "Set ANTHROPIC_API_KEY in .env to enable. Used as fallback for complex tasks.",
+        "models": [
+          {
+            "id": "claude-sonnet-4-20250514",
+            "name": "Claude Sonnet 4 (Cloud)",
+            "reasoning": true,
+            "input": ["text", "image"]
+          }
+        ]
+      },
+      "openai": {
+        "_comment": "Set OPENAI_API_KEY in .env to enable. Alternative cloud fallback.",
+        "models": [
+          {
+            "id": "gpt-4o",
+            "name": "GPT-4o (Cloud)",
+            "reasoning": true,
+            "input": ["text", "image"]
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "ollama/qwen3-coder"
+      },
+      "models": {
+        "ollama/qwen3-coder": { "alias": "local" },
+        "ollama/glm-4.7": { "alias": "local-large" },
+        "anthropic/claude-sonnet-4-20250514": { "alias": "cloud" },
+        "openai/gpt-4o": { "alias": "cloud-alt" }
+      },
+      "compaction": {
+        "mode": "safeguard"
+      },
+      "maxConcurrent": 2,
+      "subagents": {
+        "maxConcurrent": 4
+      }
+    }
+  },
+  "tools": {
+    "web": {
+      "search": { "enabled": false },
+      "fetch": { "enabled": true }
+    },
+    "exec": {
+      "security": "allowlist",
+      "ask": "off"
+    }
+  }
+}

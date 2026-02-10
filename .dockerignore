@@ -1,0 +1,12 @@
+.env
+data/
+backups/
+*.md
+.git
+.gitignore
+docker-compose.agents.yml
+docker-compose.override.yml
+scripts/
+config/
+proxy/
+controller/

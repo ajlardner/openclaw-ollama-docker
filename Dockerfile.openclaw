@@ -1,0 +1,39 @@
+FROM node:22-bookworm
+
+ARG EXTRA_APT_PACKAGES=""
+
+# Install system deps + optional extras
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    git curl jq ca-certificates \
+    ${EXTRA_APT_PACKAGES} && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Bun (required for OpenClaw build)
+RUN curl -fsSL https://bun.sh/install | bash
+ENV PATH="/root/.bun/bin:${PATH}"
+
+RUN corepack enable
+
+WORKDIR /app
+
+# Clone OpenClaw
+RUN git clone --depth 1 https://github.com/openclaw/openclaw.git .
+
+# Install deps (cached unless lockfile changes)
+RUN pnpm install --frozen-lockfile
+
+# Build
+RUN pnpm build
+RUN pnpm ui:install 2>/dev/null || true
+RUN pnpm ui:build 2>/dev/null || true
+
+# Create non-root user
+RUN groupadd -r openclaw && useradd -r -g openclaw -d /home/node -s /bin/bash node || true
+RUN mkdir -p /home/node/.openclaw/workspace && chown -R 1000:1000 /home/node
+
+USER node
+ENV NODE_ENV=production
+ENV HOME=/home/node
+
+CMD ["node", "dist/index.js", "gateway"]

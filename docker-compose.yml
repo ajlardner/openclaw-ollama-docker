@@ -1,0 +1,246 @@
+services:
+  # ===========================================================================
+  # Ollama — Local LLM Inference Engine
+  # ===========================================================================
+  # Runs on internal-only network. Zero internet access.
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    volumes:
+      - ${OLLAMA_DATA_DIR:-./data/ollama-models}:/root/.ollama
+    environment:
+      OLLAMA_FLASH_ATTENTION: ${OLLAMA_FLASH_ATTENTION:-1}
+      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-1}
+      OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-2}
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-10m}
+      OLLAMA_HOST: "0.0.0.0:11434"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    networks:
+      - internal
+
+  # Ollama with NVIDIA GPU support (use --profile gpu)
+  ollama-gpu:
+    extends:
+      service: ollama
+    container_name: ollama-gpu
+    profiles:
+      - gpu
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ===========================================================================
+  # Discord Proxy — Outbound traffic filter
+  # ===========================================================================
+  # Squid forward proxy that ONLY allows Discord API domains.
+  # All other outbound internet traffic is blocked.
+  discord-proxy:
+    image: ubuntu/squid:latest
+    container_name: discord-proxy
+    restart: unless-stopped
+    volumes:
+      - ./proxy/squid.conf:/etc/squid/squid.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "squidclient -h localhost mgr:info || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - internal
+      - egress
+
+  # ===========================================================================
+  # OpenClaw Gateway — AI Agent Platform
+  # ===========================================================================
+  # Connected to internal network only (reaches Ollama + proxy).
+  # All outbound goes through discord-proxy — only Discord domains allowed.
+  openclaw-gateway:
+    image: ${OPENCLAW_IMAGE:-openclaw:local}
+    container_name: openclaw-gateway
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+      discord-proxy:
+        condition: service_healthy
+    environment:
+      HOME: /home/node
+      TERM: xterm-256color
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:-}
+      # Force all HTTP(S) through the proxy
+      HTTP_PROXY: http://discord-proxy:3128
+      HTTPS_PROXY: http://discord-proxy:3128
+      http_proxy: http://discord-proxy:3128
+      https_proxy: http://discord-proxy:3128
+      # Bypass proxy for internal services (Ollama)
+      NO_PROXY: ollama,ollama-gpu,localhost,127.0.0.1
+      no_proxy: ollama,ollama-gpu,localhost,127.0.0.1
+    volumes:
+      - ${OPENCLAW_CONFIG_DIR:-./data/openclaw-config}:/home/node/.openclaw
+      - ${OPENCLAW_WORKSPACE_DIR:-./data/openclaw-workspace}:/home/node/.openclaw/workspace
+    ports:
+      - "${OPENCLAW_GATEWAY_PORT:-18789}:18789"
+    init: true
+    command:
+      [
+        "node",
+        "dist/index.js",
+        "gateway",
+        "--bind",
+        "${OPENCLAW_GATEWAY_BIND:-lan}",
+        "--port",
+        "18789",
+      ]
+    networks:
+      - internal
+    dns: []
+
+  # ===========================================================================
+  # OpenClaw CLI — For onboarding, config, and ad-hoc commands
+  # ===========================================================================
+  openclaw-cli:
+    image: ${OPENCLAW_IMAGE:-openclaw:local}
+    container_name: openclaw-cli
+    environment:
+      HOME: /home/node
+      TERM: xterm-256color
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:-}
+      BROWSER: echo
+      HTTP_PROXY: http://discord-proxy:3128
+      HTTPS_PROXY: http://discord-proxy:3128
+      http_proxy: http://discord-proxy:3128
+      https_proxy: http://discord-proxy:3128
+      NO_PROXY: ollama,ollama-gpu,localhost,127.0.0.1
+      no_proxy: ollama,ollama-gpu,localhost,127.0.0.1
+    volumes:
+      - ${OPENCLAW_CONFIG_DIR:-./data/openclaw-config}:/home/node/.openclaw
+      - ${OPENCLAW_WORKSPACE_DIR:-./data/openclaw-workspace}:/home/node/.openclaw/workspace
+    stdin_open: true
+    tty: true
+    init: true
+    entrypoint: ["node", "dist/index.js"]
+    networks:
+      - internal
+
+  # ===========================================================================
+  # Spawn Controller — Rate-limited agent lifecycle manager
+  # ===========================================================================
+  # Agents call this API to spawn/kill other agents. Hard limits enforced.
+  # Has Docker socket access (required to create containers).
+  spawn-controller:
+    build: ./controller
+    container_name: spawn-controller
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./data/agents:/data/agents
+      - ./data:/data
+    ports:
+      - "${CONTROLLER_PORT:-9090}:9090"
+    environment:
+      # Hard limits
+      MAX_AGENTS: ${MAX_AGENTS:-10}
+      MAX_CPU_PER_AGENT: ${MAX_CPU_PER_AGENT:-1.0}
+      MAX_MEM_PER_AGENT: ${MAX_MEM_PER_AGENT:-512}
+      MAX_TOTAL_MEM: ${MAX_TOTAL_MEM:-4096}
+      # Rate limiting
+      SPAWN_COOLDOWN_SEC: ${SPAWN_COOLDOWN_SEC:-30}
+      MAX_SPAWNS_PER_HOUR: ${MAX_SPAWNS_PER_HOUR:-10}
+      # Auth
+      CONTROLLER_AUTH_TOKEN: ${CONTROLLER_AUTH_TOKEN:-}
+      # Rate limiting (per agent)
+      MAX_MESSAGES_PER_MINUTE: ${MAX_MESSAGES_PER_MINUTE:-10}
+      MAX_MESSAGES_PER_HOUR: ${MAX_MESSAGES_PER_HOUR:-200}
+      MAX_MESSAGE_LENGTH: ${MAX_MESSAGE_LENGTH:-2000}
+      # Auto-cleanup
+      IDLE_TIMEOUT_MIN: ${IDLE_TIMEOUT_MIN:-60}
+      CLEANUP_INTERVAL_SEC: ${CLEANUP_INTERVAL_SEC:-60}
+      # Infra refs
+      INTERNAL_NETWORK: openclaw-ollama-docker_internal
+      OPENCLAW_IMAGE: ${OPENCLAW_IMAGE:-openclaw:local}
+      DEFAULT_MODEL: ${DEFAULT_MODEL:-qwen3-coder}
+      PROXY_HOST: discord-proxy:3128
+      DATA_DIR: /data/agents
+      CONTROLLER_PORT: "9090"
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/limits || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ===========================================================================
+  # Ollama Admin — Host-accessible Ollama API for model management
+  # ===========================================================================
+  # Since Ollama is on an internal network, this sidecar exposes the API
+  # to the host for pulling models, listing, etc.
+  # Usage: docker compose run --rm ollama-admin ollama pull qwen3-coder
+  ollama-admin:
+    image: ollama/ollama:latest
+    container_name: ollama-admin
+    profiles:
+      - admin
+    environment:
+      OLLAMA_HOST: "ollama:11434"
+    entrypoint: ["ollama"]
+    networks:
+      - internal
+      - egress
+
+  # ===========================================================================
+  # Caddy Reverse Proxy (optional, --profile proxy)
+  # ===========================================================================
+  caddy:
+    image: caddy:2-alpine
+    container_name: openclaw-proxy
+    restart: unless-stopped
+    profiles:
+      - proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    networks:
+      - internal
+      - egress
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  # Internal network — NO internet access
+  # OpenClaw, Ollama, and the proxy all live here
+  internal:
+    driver: bridge
+    internal: true
+
+  # Egress network — has internet access
+  # ONLY the discord-proxy and admin tools connect here
+  # OpenClaw and Ollama do NOT connect to this network
+  egress:
+    driver: bridge
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  caddy_data:
+  caddy_config:
